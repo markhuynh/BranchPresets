@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Linq;
 using Sitecore;
 using Sitecore.Data.Items;
 using Sitecore.Diagnostics;
@@ -7,75 +8,102 @@ using Sitecore.StringExtensions;
 
 namespace BranchPresets
 {
-	/// <summary>
-	/// Augments the functionality of Branch Templates by making any rendering data sources set in the layout on the branch
-	/// that point to other children of the branch be repointed to the newly created branch item
-	/// instead of the source branch item. This allows for templating including data source items using branches.
-	/// </summary>
-	public class AddFromBranchPreset : AddFromTemplateProcessor
-	{
-		public override void Process(AddFromTemplateArgs args)
-		{
-			Assert.ArgumentNotNull(args, nameof(args));
+    /// <summary>
+    /// Augments the functionality of Branch Templates by making any rendering data sources set in the layout on the branch
+    /// that point to other children of the branch be repointed to the newly created branch item
+    /// instead of the source branch item. This allows for templating including data source items using branches.
+    /// </summary>
+    public class AddFromBranchPreset : AddFromTemplateProcessor
+    {
+        #region Public Methods and Operators
 
-			if (args.Destination.Database.Name != "master") return;
+        public override void Process(AddFromTemplateArgs args)
+        {
+            Assert.ArgumentNotNull(args, nameof(args));
 
-			var templateItem = args.Destination.Database.GetItem(args.TemplateId);
+            if (args.Destination.Database.Name != "master")
+            {
+                return;
+            }
 
-			Assert.IsNotNull(templateItem, "Template did not exist!");
+            var templateItem = args.Destination.Database.GetItem(args.TemplateId);
 
-			// if this isn't a branch template, we can use the stock behavior
-			if (templateItem.TemplateID != TemplateIDs.BranchTemplate) return;
+            Assert.IsNotNull(templateItem, "Template did not exist!");
 
-			Assert.HasAccess((args.Destination.Access.CanCreate() ? 1 : 0) != 0, "AddFromTemplate - Add access required (destination: {0}, template: {1})", args.Destination.ID, args.TemplateId);
+            // if this isn't a branch template, we can use the stock behavior
+            if (templateItem.TemplateID != TemplateIDs.BranchTemplate)
+            {
+                return;
+            }
 
-			// Create the branch template instance
-			Item newItem = args.Destination.Database.Engines.DataEngine.AddFromTemplate(args.ItemName, args.TemplateId, args.Destination, args.NewId);
+            Assert.HasAccess((args.Destination.Access.CanCreate() ? 1 : 0) != 0, "AddFromTemplate - Add access required (destination: {0}, template: {1})", args.Destination.ID, args.TemplateId);
 
-			// find all rendering data sources on the branch root item that point to an item under the branch template,
-			// and repoint them to the equivalent subitem under the branch instance
-			RewriteBranchRenderingDataSources(newItem, templateItem);
+            // Create the branch template instance
+            var newItem = args.Destination.Database.Engines.DataEngine.AddFromTemplate(args.ItemName, args.TemplateId, args.Destination, args.NewId);
 
-			args.Result = newItem;
-		}
+            // find all rendering data sources on the branch root item that point to an item under the branch template,
+            // and repoint them to the equivalent subitem under the branch instance
+            RewriteBranchRenderingDataSources(newItem, templateItem, newItem.Paths.FullPath);
 
-		protected virtual void RewriteBranchRenderingDataSources(Item item, BranchItem branchTemplateItem)
-		{
-			string branchBasePath = branchTemplateItem.InnerItem.Paths.FullPath;
+            args.Result = newItem;
+        }
 
-			LayoutHelper.ApplyActionToAllRenderings(item, rendering =>
-			{
-				if (string.IsNullOrWhiteSpace(rendering.Datasource))
-					return RenderingActionResult.None;
+        #endregion
 
-				// note: queries and multiple item datasources are not supported
-				var renderingTargetItem = item.Database.GetItem(rendering.Datasource);
+        #region Methods
 
-				if (renderingTargetItem == null)
-					Log.Warn("Error while expanding branch template rendering datasources: data source {0} was not resolvable.".FormatWith(rendering.Datasource), this);
+        protected virtual void RewriteBranchRenderingDataSources(Item item, BranchItem branchTemplateItem, string branchRoot)
+        {
+            var branchBasePath = branchTemplateItem.InnerItem.Paths.FullPath;
 
-				// if there was no valid target item OR the target item is not a child of the branch template we skip out
-				if (renderingTargetItem == null || !renderingTargetItem.Paths.FullPath.StartsWith(branchBasePath, StringComparison.OrdinalIgnoreCase))
-					return RenderingActionResult.None;
+            LayoutHelper.ApplyActionToAllRenderings(item, rendering =>
+            {
+                if (string.IsNullOrWhiteSpace(rendering.Datasource))
+                {
+                    return RenderingActionResult.None;
+                }
 
-				var relativeRenderingPath = renderingTargetItem.Paths.FullPath.Substring(branchBasePath.Length).TrimStart('/');
-				relativeRenderingPath = relativeRenderingPath.Substring(relativeRenderingPath.IndexOf('/')); // we need to skip the "/$name" at the root of the branch children
+                // note: queries and multiple item datasources are not supported
+                var renderingTargetItem = item.Database.GetItem(rendering.Datasource);
 
-				var newTargetPath = item.Paths.FullPath + relativeRenderingPath;
+                if (renderingTargetItem == null)
+                {
+                    Log.Warn("Error while expanding branch template rendering datasources: data source {0} was not resolvable.".FormatWith(rendering.Datasource), this);
+                }
 
-				var newTargetItem = item.Database.GetItem(newTargetPath);
+                // if there was no valid target item OR the target item is not a child of the branch template we skip out
+                if (renderingTargetItem == null || !renderingTargetItem.Paths.FullPath.StartsWith(branchBasePath, StringComparison.OrdinalIgnoreCase))
+                {
+                    return RenderingActionResult.None;
+                }
 
-				// if the target item was a valid under branch item, but the same relative path does not exist under the branch instance
-				// we set the datasource to something invalid to avoid any potential unintentional edits of a shared data source item
-				if (newTargetItem == null)
-				{
-					rendering.Datasource = "INVALID_BRANCH_SUBITEM_ID";
-					return RenderingActionResult.None;
-				}
+                var relativeRenderingPath = renderingTargetItem.Paths.FullPath.Substring(branchBasePath.Length).TrimStart('/');
+                relativeRenderingPath = relativeRenderingPath.Substring(relativeRenderingPath.IndexOf('/')); // we need to skip the "/$name" at the root of the branch children
 
-				rendering.Datasource = newTargetItem.ID.ToString();
-				return RenderingActionResult.None;
-			});
-		}
-	}
+                var newTargetPath = (item.Paths.FullPath + relativeRenderingPath).Replace(' ', '-');
+
+                var newTargetItem = item.Database.GetItem(newTargetPath);
+
+                // if the target item was a valid under branch item, but the same relative path does not exist under the branch instance
+                // we set the datasource to something invalid to avoid any potential unintentional edits of a shared data source item
+                if (newTargetItem == null)
+                {
+                    rendering.Datasource = "INVALID_BRANCH_SUBITEM_ID";
+                    return RenderingActionResult.None;
+                }
+
+                rendering.Datasource = newTargetItem.ID.ToString();
+                return RenderingActionResult.None;
+            });
+
+            if (!item.HasChildren)
+            {
+                return;
+            }
+
+            item.Children.ToList().ForEach(x => RewriteBranchRenderingDataSources(x, branchTemplateItem, branchRoot));
+        }
+
+        #endregion
+    }
 }
